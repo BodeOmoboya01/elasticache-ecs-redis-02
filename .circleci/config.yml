@@ -1,0 +1,325 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@3.1
+
+jobs:
+  # The initial job that creates the S3 bucket and DynamoDB table
+  create-state-storage:
+    docker:
+      - image: cimg/base:2023.10
+    resource_class: medium
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Install Terraform
+          command: |
+            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install terraform
+      - run:
+          name: Create S3 bucket and DynamoDB table
+          command: |
+            # Create S3 bucket directly with AWS CLI
+            echo "Creating S3 bucket with AWS CLI..."
+            aws s3api create-bucket --bucket elasticache-ecs-terraform-state --region us-east-1 || true
+
+            # Enable versioning
+            aws s3api put-bucket-versioning --bucket elasticache-ecs-terraform-state --versioning-configuration Status=Enabled
+
+            # Enable encryption
+            aws s3api put-bucket-encryption --bucket elasticache-ecs-terraform-state --server-side-encryption-configuration '{"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}'
+
+            # Block public access
+            aws s3api put-public-access-block --bucket elasticache-ecs-terraform-state --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+            # Create DynamoDB table
+            aws dynamodb create-table --table-name elasticache-ecs-terraform-locks \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST \
+              --region us-east-1 || true
+
+            echo "S3 bucket and DynamoDB table created successfully!"
+      - run:
+          name: Wait for S3 bucket availability
+          command: |
+            echo "Waiting for S3 bucket to be fully available..."
+            sleep 10
+            aws s3api head-bucket --bucket elasticache-ecs-terraform-state || {
+              echo "Bucket not yet available, waiting longer..."
+              sleep 20
+              aws s3api head-bucket --bucket elasticache-ecs-terraform-state
+            }
+
+  plan:
+    docker:
+      - image: cimg/base:2023.10
+    resource_class: medium
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Install Terraform
+          command: |
+            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install terraform
+      - run:
+          name: Terraform Init and Plan
+          command: |
+            # Change to the terraform directory
+            cd terraform
+            
+            # Rename provider files to use CI version
+            mv provider.ci.tf provider.active.tf
+            mv provider.local.tf provider.local.tf.disabled
+            
+            # Initialize with S3 backend (bucket should exist from previous step)
+            terraform init
+            terraform plan -out=tfplan
+      - persist_to_workspace:
+          root: terraform
+          paths:
+            - tfplan
+      - persist_to_workspace:
+          root: .
+          paths:
+            - terraform/*
+            - app/*
+
+  apply:
+    docker:
+      - image: cimg/base:2023.10
+    resource_class: medium
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Install Terraform
+          command: |
+            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install terraform
+      - attach_workspace:
+          at: terraform
+      - run:
+          name: Terraform Apply
+          command: |
+            # Change to the terraform directory
+            cd terraform
+            
+            # Rename provider files to use CI version
+            mv provider.ci.tf provider.active.tf
+            mv provider.local.tf provider.local.tf.disabled
+            
+            # Initialize with S3 backend
+            terraform init
+            terraform apply -auto-approve tfplan
+
+  build-and-deploy-app:
+    docker:
+      - image: cimg/base:2023.10
+    resource_class: medium
+    steps:
+      - checkout
+      - aws-cli/setup
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Install Terraform
+          command: |
+            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install -y terraform
+      - run:
+          name: Wait for Terraform State
+          command: |
+            echo "Waiting for Terraform state to be fully available..."
+            
+            cd terraform
+            
+            # Rename provider files to use CI version
+            mv -f provider.ci.tf provider.active.tf 2>/dev/null || true
+            mv provider.local.tf provider.local.tf.disabled 2>/dev/null || true
+            
+            # Initialize with S3 backend
+            terraform init
+            
+            # Check if ECS cluster exists in state
+            MAX_ATTEMPTS=10
+            ATTEMPT=1
+            
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              echo "Attempt $ATTEMPT of $MAX_ATTEMPTS: Checking for ECS cluster in Terraform state..."
+              
+              if terraform state list | grep aws_ecs_cluster.main ; then
+                echo "✅ ECS cluster found in state. Proceeding with deployment."
+                break
+              else
+                echo "⚠️ ECS cluster not yet available in state. Waiting..."
+                
+                if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                  echo "❌ Timed out waiting for Terraform state to be available."
+                  exit 1
+                fi
+                
+                sleep 15
+                ATTEMPT=$((ATTEMPT+1))
+              fi
+            done
+            
+            cd ..
+      - run:
+          name: Get Terraform Outputs
+          command: |
+            cd terraform
+            
+            # Get ECR URL and other outputs
+            ECR_URL=$(terraform output -raw ecr_repository_url)
+            ECS_CLUSTER=$(terraform output -raw ecs_cluster_name)
+            ECS_SERVICE=$(terraform output -raw ecs_service_name)
+            ALB_DNS=$(terraform output -raw alb_dns_name)
+            
+            # Export for next steps
+            echo "export ECR_URL=$ECR_URL" >> $BASH_ENV
+            echo "export ECS_CLUSTER=$ECS_CLUSTER" >> $BASH_ENV
+            echo "export ECS_SERVICE=$ECS_SERVICE" >> $BASH_ENV
+            echo "export ALB_DNS=$ALB_DNS" >> $BASH_ENV
+            
+            cd ..
+      - run:
+          name: Build and Push Docker Image
+          command: |
+            # Login to ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${ECR_URL%/*}
+            
+            # Build Docker image
+            cd app
+            docker build -t redis-ecs-demo .
+            
+            # Tag and push
+            docker tag redis-ecs-demo:latest ${ECR_URL}:latest
+            docker tag redis-ecs-demo:latest ${ECR_URL}:${CIRCLE_SHA1}
+            docker push ${ECR_URL}:latest
+            docker push ${ECR_URL}:${CIRCLE_SHA1}
+      - run:
+          name: Update ECS Service
+          command: |
+            # Force new deployment
+            aws ecs update-service \
+              --cluster $ECS_CLUSTER \
+              --service $ECS_SERVICE \
+              --force-new-deployment \
+              --region us-east-1
+            
+            # Wait for service to stabilize
+            echo "Waiting for ECS service to stabilize..."
+            aws ecs wait services-stable \
+              --cluster $ECS_CLUSTER \
+              --services $ECS_SERVICE \
+              --region us-east-1
+      - run:
+          name: Display Application URL
+          command: |
+            echo ""
+            echo "================================================================"
+            echo "Application is accessible at: http://$ALB_DNS"
+            echo "================================================================"
+            echo ""
+            echo "Note: It may take a few minutes for the ALB to become healthy."
+            
+            # Save URL to artifacts
+            mkdir -p /tmp/artifacts
+            echo "Application URL: http://$ALB_DNS" > /tmp/artifacts/application-url.txt
+      - store_artifacts:
+          path: /tmp/artifacts
+          destination: artifacts
+
+  destroy:
+    docker:
+      - image: cimg/base:2023.10
+    resource_class: medium
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Install Terraform
+          command: |
+            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install terraform
+      - run:
+          name: Terraform Destroy
+          command: |
+            # Change to the terraform directory
+            cd terraform
+            
+            # Rename provider files to use CI version
+            mv provider.ci.tf provider.active.tf
+            mv provider.local.tf provider.local.tf.disabled
+            
+            # Initialize with S3 backend
+            terraform init
+            
+            # Destroy all infrastructure
+            terraform destroy -auto-approve || {
+              echo "⚠️ First destroy attempt failed, retrying after a short delay..."
+              sleep 30
+              terraform destroy -auto-approve
+            }
+
+workflows:
+  version: 2
+  deploy-elasticache-ecs:
+    jobs:
+      - create-state-storage:
+          context: aws-dev
+          filters:
+            branches:
+              only: main
+      - plan:
+          context: aws-dev
+          requires:
+            - create-state-storage
+          filters:
+            branches:
+              only: main
+      - approve-apply:
+          type: approval
+          requires:
+            - plan
+          filters:
+            branches:
+              only: main
+      - apply:
+          context: aws-dev
+          requires:
+            - approve-apply
+          filters:
+            branches:
+              only: main
+      - build-and-deploy-app:
+          context: aws-dev
+          requires:
+            - apply
+          filters:
+            branches:
+              only: main
+  
+  # This is a separate workflow that can be triggered manually to destroy the infrastructure
+  cleanup-infrastructure:
+    jobs:
+      - approve-destroy:
+          type: approval
+          filters:
+            branches:
+              only: main
+      - destroy:
+          context: aws-dev
+          requires:
+            - approve-destroy
+          filters:
+            branches:
+              only: main
