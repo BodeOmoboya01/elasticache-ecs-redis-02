@@ -18,6 +18,26 @@ output "redis_port" {
   value       = aws_elasticache_replication_group.main.port
 }
 
+output "redis_secondary_endpoint" {
+  description = "Secondary Redis cluster endpoint (KMS encrypted)"
+  value       = aws_elasticache_replication_group.secondary.primary_endpoint_address
+}
+
+output "redis_secondary_port" {
+  description = "Secondary Redis cluster port"
+  value       = aws_elasticache_replication_group.secondary.port
+}
+
+output "kms_key_arn" {
+  description = "KMS key ARN used for ElastiCache encryption"
+  value       = aws_kms_key.elasticache.arn
+}
+
+output "kms_key_id" {
+  description = "KMS key ID used for ElastiCache encryption"
+  value       = aws_kms_key.elasticache.key_id
+}
+
 output "ecs_cluster_name" {
   description = "Name of the ECS cluster"
   value       = aws_ecs_cluster.main.name
@@ -43,11 +63,18 @@ output "estimated_monthly_cost" {
   value       = <<-EOT
     Estimated Monthly Costs (USD):
     - NAT Instance (t3.nano): ~$3.80
-    - ElastiCache (t3.micro): ~$13
+    - ElastiCache Main (t3.micro): ~$13
+    - ElastiCache Secondary (t3.micro + KMS): ~$14 (includes ~$1 for KMS key)
     - ALB: ~$16 + data transfer
     - ECS Fargate Spot: ~$3-5
     - CloudWatch Logs: ~$1
-    - Total: ~$37-39/month
+    - Total (with dual clusters): ~$51-53/month
+    - Total (after migration): ~$38-40/month
+    
+    Migration Note:
+    - Currently running dual ElastiCache clusters for migration
+    - Secondary cluster uses customer-managed KMS encryption
+    - After migration, decommission main cluster to save ~$13/month
     
     Cost Savings:
     - Using NAT Instance instead of NAT Gateway saves ~$41/month!
